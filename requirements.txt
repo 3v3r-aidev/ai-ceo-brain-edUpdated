@@ -1,4 +1,4 @@
-openai==0.28.1
+openai>=1.40.0,<2
 faiss-cpu
 numpy
 pandas
