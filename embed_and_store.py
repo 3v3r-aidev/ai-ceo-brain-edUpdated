@@ -36,6 +36,7 @@ EMBED_DIM = 1536
 INDEX_PATH = EMBED_DIR / "faiss.index"
 META_PATH = EMBED_DIR / "metadata.pkl"
 REPORT_CSV = EMBED_DIR / "embedding_report.csv"
+REG_CSV = EMBED_DIR / "knowledge_registry.csv"  # optional curation registry
 
 _base_index = faiss.IndexFlatL2(EMBED_DIM)
 _index = faiss.IndexIDMap2(_base_index)
@@ -43,26 +44,79 @@ _index = faiss.IndexIDMap2(_base_index)
 _metadata: Dict[int, Dict] = {}
 _next_id = 0
 
-_CANON_MEETING = re.compile(r'^(?P<y>\d{4})-(?P<m>\d{2})-(?P<d>\d{2})_Meeting-Summary', re.IGNORECASE)
+# Support both naming styles:
+# 1) 2025-09-02_Meeting-Summary(...)
+_CANON_MEETING = re.compile(
+    r'^(?P<y>\d{4})-(?P<m>\d{2})-(?P<d>\d{2})_Meeting[-_ ]?Summary',
+    re.IGNORECASE
+)
+# 2) Meeting_Summary_02-September-2025
+_HUMAN_MEETING = re.compile(
+    r'^Meeting[_ -]Summary[_ -](?P<d>\d{1,2})[-_ ](?P<mon>[A-Za-z]+)[-_ ](?P<y>\d{4})',
+    re.IGNORECASE
+)
+
+_MONTHS_MAP = {
+    m.lower(): i for i, m in enumerate(
+        ["January","February","March","April","May","June","July","August","September","October","November","December"], 1
+    )
+}
+# Accept short month keys too
+_MONTHS_MAP.update({
+    "jan":1,"feb":2,"mar":3,"apr":4,"may":5,"jun":6,"jul":7,"aug":8,"sep":9,"sept":9,"oct":10,"nov":11,"dec":12
+})
+
 ISO_DATE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
 
+
+def _load_registry() -> Dict[str, Dict]:
+    """
+    Optional: load knowledge_registry.csv to respect active/archived items and canonical keys.
+    Keyed by absolute path.
+    """
+    reg: Dict[str, Dict] = {}
+    if REG_CSV.exists():
+        with open(REG_CSV, newline="", encoding="utf-8") as f:
+            for row in csv.DictReader(f):
+                reg[row.get("path", "")] = row
+    return reg
+
+
 def _date_from_filename(fname: str) -> Optional[str]:
-    m = _CANON_MEETING.match(Path(fname).stem)
-    if not m:
-        return None
-    try:
-        return datetime(int(m['y']), int(m['m']), int(m['d'])).strftime("%Y-%m-%d")
-    except Exception:
-        return None
+    stem = Path(fname).stem
+
+    m = _CANON_MEETING.match(stem)
+    if m:
+        try:
+            return datetime(int(m['y']), int(m['m']), int(m['d'])).strftime("%Y-%m-%d")
+        except Exception:
+            pass
+
+    h = _HUMAN_MEETING.match(stem)
+    if h:
+        try:
+            mon = _MONTHS_MAP.get(h.group('mon').lower())
+            if mon:
+                return datetime(int(h.group('y')), int(mon), int(h.group('d'))).strftime("%Y-%m-%d")
+        except Exception:
+            pass
+
+    return None
+
 
 def _coerce_iso(d: Optional[str]) -> Optional[str]:
-    if not d: return None
+    if not d:
+        return None
     d = d.strip()
-    if ISO_DATE.match(d): return d
+    if ISO_DATE.match(d):
+        return d
     for fmt in ("%Y/%m/%d", "%d-%m-%Y", "%d/%m/%Y", "%b %d %Y", "%B %d %Y"):
-        try: return datetime.strptime(d, fmt).strftime("%Y-%m-%d")
-        except Exception: pass
+        try:
+            return datetime.strptime(d, fmt).strftime("%Y-%m-%d")
+        except Exception:
+            pass
     return None
+
 
 def _extract_headers(text: str) -> dict:
     """
@@ -88,18 +142,24 @@ def _extract_headers(text: str) -> dict:
             out["valid_to"] = _coerce_iso(ln.split(":", 1)[1])
     return out
 
+
 def _embed_client(text: str) -> np.ndarray:
     resp = _client.embeddings.create(model=EMBED_MODEL, input=text)
     return np.asarray(resp.data[0].embedding, dtype=np.float32)
+
 
 def _embed_legacy(text: str) -> np.ndarray:
     resp = openai.Embedding.create(model=EMBED_MODEL, input=text)  # type: ignore
     return np.asarray(resp["data"][0]["embedding"], dtype=np.float32)
 
+
 def get_embedding(text: str) -> Optional[np.ndarray]:
+    def _call():
+        return _embed_client(text) if _use_client else _embed_legacy(text)
+
     for attempt in range(4):
         try:
-            arr = _embed_client(text) if _use_client else _embed_legacy(text)
+            arr = _call()
             if arr.shape != (EMBED_DIM,):
                 raise ValueError(f"Unexpected embedding shape {arr.shape}")
             return arr
@@ -110,8 +170,10 @@ def get_embedding(text: str) -> Optional[np.ndarray]:
     print("Failed to embed after retries.")
     return None
 
+
 def add_to_index(vec: np.ndarray, vid: int) -> None:
     _index.add_with_ids(vec.reshape(1, -1), np.array([vid], dtype=np.int64))
+
 
 def main():
     global _next_id
@@ -124,17 +186,27 @@ def main():
         print("No .txt files found in parsed_data.")
         return
 
+    registry = _load_registry()
+
     print(f"Found {len(files)} files to embed.")
-    report_rows: List[tuple] = [("filename", "folder", "meeting_date", "title", "tags", "valid_from", "valid_to", "chunks", "chars")]
+    report_rows: List[tuple] = [(
+        "filename", "folder", "meeting_date", "title", "tags",
+        "valid_from", "valid_to", "chunks", "chars"
+    )]
 
     for fp in tqdm(files, desc="Embedding"):
-        text = fp.read_text(encoding="utf-8").strip()
+        # If curated registry marks this path archived, skip
+        reg_row = registry.get(str(fp))
+        if reg_row and reg_row.get("status", "").lower() == "archived":
+            continue
+
+        text = fp.read_text(encoding="utf-8", errors="ignore").strip()
         if not text:
             print(f"Skipping empty: {fp.name}")
             continue
 
         headers = _extract_headers(text)
-        folder_label = headers["folder"]
+        folder_label = headers["folder"] or ""
         orig_name = headers["original_file"] or fp.name
 
         meeting_date_iso = _date_from_filename(orig_name) if folder_label.lower() == "meetings" else None
@@ -143,10 +215,27 @@ def main():
         valid_from = headers["valid_from"]
         valid_to = headers["valid_to"]
 
+        # Decide canonical_key/version_ts
+        if reg_row:
+            canonical_key = reg_row.get("canonical_key", "") or (title or Path(fp.name).stem).lower()
+            version_ts = reg_row.get("version_ts", "") or (meeting_date_iso or (valid_from or ""))
+        else:
+            if folder_label.lower() == "meetings":
+                canonical_key = Path(fp.name).stem.lower()
+                version_ts = meeting_date_iso or ""
+            else:
+                canonical_key = (title or Path(fp.name).stem).lower()
+                version_ts = valid_from or ""
+
+        # Chunking
         chunks = simple_chunks(text, max_chars=3500, overlap=300) or [{"chunk_id": 0, "text": text[:3500]}]
         total_chars = sum(len(ch["text"]) for ch in chunks)
-        report_rows.append((fp.name, folder_label or "", meeting_date_iso or "", title, ";".join(tags), valid_from or "", valid_to or "", len(chunks), total_chars))
+        report_rows.append((
+            fp.name, folder_label, meeting_date_iso or "", title, ";".join(tags),
+            valid_from or "", valid_to or "", len(chunks), total_chars
+        ))
 
+        # Embed chunks
         for ch in chunks:
             vec = get_embedding(ch["text"])
             if vec is None:
@@ -164,6 +253,8 @@ def main():
                 "tags": tags,
                 "valid_from": valid_from,
                 "valid_to": valid_to,
+                "canonical_key": canonical_key,
+                "version_ts": version_ts,
             }
             _next_id += 1
 
@@ -174,9 +265,11 @@ def main():
     with open(REPORT_CSV, "w", newline="", encoding="utf-8") as f:
         csv.writer(f).writerows(report_rows)
 
-    print(f"✅ Saved FAISS index to {INDEX_PATH}")
-    print(f"✅ Saved metadata for {len(_metadata)} vectors to {META_PATH}")
-    print(f"📝 Wrote embedding health report to {REPORT_CSV}")
+    print(f"Saved FAISS index to {INDEX_PATH}")
+    print(f"Saved metadata for {len(_metadata)} vectors to {META_PATH}")
+    print(f"Wrote embedding health report to {REPORT_CSV}")
+
 
 if __name__ == "__main__":
     main()
+
