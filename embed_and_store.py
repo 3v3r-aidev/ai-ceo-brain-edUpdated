@@ -24,7 +24,7 @@ try:
 except Exception:
     _client = None
     _use_client = False
-    import openai
+    import openai  # type: ignore
     openai.api_key = os.getenv("OPENAI_API_KEY")
 
 PARSED_DIR = Path("parsed_data")
@@ -36,7 +36,7 @@ EMBED_DIM = 1536
 INDEX_PATH = EMBED_DIR / "faiss.index"
 META_PATH = EMBED_DIR / "metadata.pkl"
 REPORT_CSV = EMBED_DIR / "embedding_report.csv"
-REG_CSV = EMBED_DIR / "knowledge_registry.csv"  # optional curation registry
+REG_CSV = EMBED_DIR / "knowledge_registry.csv"
 
 _base_index = faiss.IndexFlatL2(EMBED_DIM)
 _index = faiss.IndexIDMap2(_base_index)
@@ -44,64 +44,59 @@ _index = faiss.IndexIDMap2(_base_index)
 _metadata: Dict[int, Dict] = {}
 _next_id = 0
 
-# Support both naming styles:
-# 1) 2025-09-02_Meeting-Summary(...)
+# --- Meeting filename patterns (support canonical + human-readable) ---
 _CANON_MEETING = re.compile(
     r'^(?P<y>\d{4})-(?P<m>\d{2})-(?P<d>\d{2})_Meeting[-_ ]?Summary',
-    re.IGNORECASE
+    re.IGNORECASE,
 )
-# 2) Meeting_Summary_02-September-2025
 _HUMAN_MEETING = re.compile(
     r'^Meeting[_ -]Summary[_ -](?P<d>\d{1,2})[-_ ](?P<mon>[A-Za-z]+)[-_ ](?P<y>\d{4})',
-    re.IGNORECASE
+    re.IGNORECASE,
 )
-
 _MONTHS_MAP = {
     m.lower(): i for i, m in enumerate(
-        ["January","February","March","April","May","June","July","August","September","October","November","December"], 1
+        ["January", "February", "March", "April", "May", "June",
+         "July", "August", "September", "October", "November", "December"], start=1
     )
 }
-# Accept short month keys too
+# Also allow short month keys
 _MONTHS_MAP.update({
-    "jan":1,"feb":2,"mar":3,"apr":4,"may":5,"jun":6,"jul":7,"aug":8,"sep":9,"sept":9,"oct":10,"nov":11,"dec":12
+    "jan": 1, "feb": 2, "mar": 3, "apr": 4, "may": 5, "jun": 6,
+    "jul": 7, "aug": 8, "sep": 9, "sept": 9, "oct": 10, "nov": 11, "dec": 12
 })
-
-ISO_DATE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
-
-
-def _load_registry() -> Dict[str, Dict]:
-    """
-    Optional: load knowledge_registry.csv to respect active/archived items and canonical keys.
-    Keyed by absolute path.
-    """
-    reg: Dict[str, Dict] = {}
-    if REG_CSV.exists():
-        with open(REG_CSV, newline="", encoding="utf-8") as f:
-            for row in csv.DictReader(f):
-                reg[row.get("path", "")] = row
-    return reg
 
 
 def _date_from_filename(fname: str) -> Optional[str]:
+    """
+    Returns ISO date (YYYY-MM-DD) if filename encodes a meeting date in either style:
+    1) 2025-09-02_Meeting-Summary...
+    2) Meeting_Summary_02-September-2025 (or short month)
+    """
     stem = Path(fname).stem
 
     m = _CANON_MEETING.match(stem)
     if m:
         try:
-            return datetime(int(m['y']), int(m['m']), int(m['d'])).strftime("%Y-%m-%d")
+            return datetime(int(m["y"]), int(m["m"]), int(m["d"])).strftime("%Y-%m-%d")
         except Exception:
             pass
 
     h = _HUMAN_MEETING.match(stem)
     if h:
         try:
-            mon = _MONTHS_MAP.get(h.group('mon').lower())
+            day = int(h["d"])
+            mon_token = h["mon"].lower()
+            mon = _MONTHS_MAP.get(mon_token)
+            year = int(h["y"])
             if mon:
-                return datetime(int(h.group('y')), int(mon), int(h.group('d'))).strftime("%Y-%m-%d")
+                return datetime(year, mon, day).strftime("%Y-%m-%d")
         except Exception:
             pass
 
     return None
+
+
+ISO_DATE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
 
 
 def _coerce_iso(d: Optional[str]) -> Optional[str]:
@@ -124,7 +119,14 @@ def _extract_headers(text: str) -> dict:
       - [FOLDER], [FILE]
       - For 'Reminders' files: Title/Tags/ValidFrom/ValidTo if present
     """
-    out = {"folder": "", "original_file": "", "title": "", "tags": [], "valid_from": None, "valid_to": None}
+    out = {
+        "folder": "",
+        "original_file": "",
+        "title": "",
+        "tags": [],
+        "valid_from": None,
+        "valid_to": None,
+    }
     lines = text.splitlines()[:25]
     for ln in lines:
         if ln.startswith("[FOLDER]:"):
@@ -154,12 +156,9 @@ def _embed_legacy(text: str) -> np.ndarray:
 
 
 def get_embedding(text: str) -> Optional[np.ndarray]:
-    def _call():
-        return _embed_client(text) if _use_client else _embed_legacy(text)
-
     for attempt in range(4):
         try:
-            arr = _call()
+            arr = _embed_client(text) if _use_client else _embed_legacy(text)
             if arr.shape != (EMBED_DIM,):
                 raise ValueError(f"Unexpected embedding shape {arr.shape}")
             return arr
@@ -173,6 +172,19 @@ def get_embedding(text: str) -> Optional[np.ndarray]:
 
 def add_to_index(vec: np.ndarray, vid: int) -> None:
     _index.add_with_ids(vec.reshape(1, -1), np.array([vid], dtype=np.int64))
+
+
+def _load_registry() -> Dict[str, Dict]:
+    """
+    Load knowledge_registry.csv (if present) to decide keep/supersede.
+    Keyed by absolute path string in the 'path' column.
+    """
+    reg: Dict[str, Dict] = {}
+    if REG_CSV.exists():
+        with open(REG_CSV, newline="", encoding="utf-8") as f:
+            for row in csv.DictReader(f):
+                reg[row.get("path", "")] = row
+    return reg
 
 
 def main():
@@ -190,14 +202,14 @@ def main():
 
     print(f"Found {len(files)} files to embed.")
     report_rows: List[tuple] = [(
-        "filename", "folder", "meeting_date", "title", "tags",
-        "valid_from", "valid_to", "chunks", "chars"
+        "filename", "folder", "meeting_date", "title", "tags", "valid_from", "valid_to",
+        "canonical_key", "version_ts", "chunks", "chars"
     )]
 
     for fp in tqdm(files, desc="Embedding"):
-        # If curated registry marks this path archived, skip
+        # Skip archived files if registry says so
         reg_row = registry.get(str(fp))
-        if reg_row and reg_row.get("status", "").lower() == "archived":
+        if reg_row and reg_row.get("status") == "archived":
             continue
 
         text = fp.read_text(encoding="utf-8", errors="ignore").strip()
@@ -206,7 +218,7 @@ def main():
             continue
 
         headers = _extract_headers(text)
-        folder_label = headers["folder"] or ""
+        folder_label = headers["folder"]
         orig_name = headers["original_file"] or fp.name
 
         meeting_date_iso = _date_from_filename(orig_name) if folder_label.lower() == "meetings" else None
@@ -215,10 +227,10 @@ def main():
         valid_from = headers["valid_from"]
         valid_to = headers["valid_to"]
 
-        # Decide canonical_key/version_ts
+        # Derive canonical_key and version_ts
         if reg_row:
             canonical_key = reg_row.get("canonical_key", "") or (title or Path(fp.name).stem).lower()
-            version_ts = reg_row.get("version_ts", "") or (meeting_date_iso or (valid_from or ""))
+            version_ts = reg_row.get("version_ts", "") or (meeting_date_iso or valid_from or "")
         else:
             if folder_label.lower() == "meetings":
                 canonical_key = Path(fp.name).stem.lower()
@@ -227,15 +239,13 @@ def main():
                 canonical_key = (title or Path(fp.name).stem).lower()
                 version_ts = valid_from or ""
 
-        # Chunking
         chunks = simple_chunks(text, max_chars=3500, overlap=300) or [{"chunk_id": 0, "text": text[:3500]}]
         total_chars = sum(len(ch["text"]) for ch in chunks)
         report_rows.append((
-            fp.name, folder_label, meeting_date_iso or "", title, ";".join(tags),
-            valid_from or "", valid_to or "", len(chunks), total_chars
+            fp.name, folder_label or "", meeting_date_iso or "", title, ";".join(tags),
+            valid_from or "", valid_to or "", canonical_key, version_ts, len(chunks), total_chars
         ))
 
-        # Embed chunks
         for ch in chunks:
             vec = get_embedding(ch["text"])
             if vec is None:
