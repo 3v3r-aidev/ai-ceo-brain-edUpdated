@@ -1,3 +1,4 @@
+# chat_ceo.py
 import json
 import re
 from pathlib import Path
@@ -13,7 +14,9 @@ from answer_with_rag import answer
 # ─────────────────────────────────────────────────────────────
 # App Config
 # ─────────────────────────────────────────────────────────────
-st.set_page_config(page_title="AI CEO Assistant 🧠", page_icon="🧠", layout="wide")
+st.set_page_config(page_title="AI CEO Assistant", page_icon=None, layout="wide")
+
+APP_VERSION = "2025-09-12-2"  # build tag to verify the running file
 
 # Credentials from secrets (fallbacks for local dev)
 USERNAME = st.secrets.get("app_user", "admin123")
@@ -28,18 +31,18 @@ HAS_CURATOR = Path("knowledge_curator.py").exists()
 # Auth
 # ─────────────────────────────────────────────────────────────
 def login():
-    st.title("🔐 Login to AI CEO Assistant")
+    st.title("Login to AI CEO Assistant")
     with st.form("login_form"):
-        u = st.text_input("👤 Username")
-        p = st.text_input("🔑 Password", type="password")
-        submitted = st.form_submit_button("➡️ Login")
+        u = st.text_input("Username")
+        p = st.text_input("Password", type="password")
+        submitted = st.form_submit_button("Login")
         if submitted:
             if u == USERNAME and p == PASSWORD:
                 st.session_state["authenticated"] = True
-                st.success("✅ Login successful.")
+                st.success("Login successful.")
                 st.rerun()
             else:
-                st.error("❌ Invalid username or password.")
+                st.error("Invalid username or password.")
 
 if "authenticated" not in st.session_state:
     st.session_state["authenticated"] = False
@@ -88,6 +91,7 @@ def save_reminder_local(content: str, title_hint: str = "") -> str:
 
     fp = reminders_dir / f"{ts}_{safe_title}.txt"
 
+    # If content already includes Title:/Tags:/ValidFrom:/Body:, keep it as-is
     is_structured = bool(re.search(r"(?mi)^\s*Title:|^\s*Tags:|^\s*ValidFrom:|^\s*Body:", content))
     if is_structured:
         payload = content.strip() + "\n"
@@ -126,8 +130,10 @@ def regenerate_reply_for_user_turn(idx: int, limit_meetings: bool, use_rag: bool
     if history[idx].get("role") != "user":
         raise ValueError("Select a USER turn to regenerate the assistant reply.")
 
+    # Build context up to and including the selected user turn
     ctx = history[: idx + 1]
 
+    # Generate a fresh reply
     try:
         reply = answer(
             history[idx]["content"],
@@ -137,7 +143,7 @@ def regenerate_reply_for_user_turn(idx: int, limit_meetings: bool, use_rag: bool
             use_rag=use_rag,
         )
     except TypeError:
-        # Backward compatibility with older answer() signatures
+        # Backward compatible with older answer() signature
         reply = answer(
             history[idx]["content"],
             k=7,
@@ -145,13 +151,14 @@ def regenerate_reply_for_user_turn(idx: int, limit_meetings: bool, use_rag: bool
             restrict_to_meetings=limit_meetings,
         )
 
+    # Find the next assistant turn after idx; if none, insert one
     next_assistant = None
     for j in range(idx + 1, len(history)):
         if history[j].get("role") == "assistant":
             next_assistant = j
             break
         if history[j].get("role") == "user":
-            break
+            break  # stop at next user message
 
     ts = datetime.now().strftime("%b-%d-%Y %I:%M%p")
     if next_assistant is not None:
@@ -170,24 +177,43 @@ def regenerate_reply_for_user_turn(idx: int, limit_meetings: bool, use_rag: bool
 # ─────────────────────────────────────────────────────────────
 # Sidebar
 # ─────────────────────────────────────────────────────────────
-st.sidebar.title("🧠 AI CEO Panel")
-st.sidebar.markdown(f"👥 Logged in as: `{USERNAME}`")
+st.sidebar.title("AI CEO Panel")
+st.sidebar.markdown(f"Logged in as: `{USERNAME}`")
+st.sidebar.caption(f"Build: {APP_VERSION}")
 
-with st.sidebar.expander("📊 Index health (embeddings)"):
+# Navigation (ASCII labels) with a hard fallback button to force editor mode
+if "force_editor" not in st.session_state:
+    st.session_state["force_editor"] = False
+
+mode = st.sidebar.radio(
+    "Navigation",
+    ("New Chat", "View History", "Edit Conversation", "Refresh Data"),
+)
+
+if st.sidebar.button("Open Editor (fallback)"):
+    st.session_state["force_editor"] = True
+if st.session_state.get("force_editor"):
+    mode = "Edit Conversation"
+
+st.sidebar.caption(f"Current mode = {mode}")
+
+# Index health
+with st.sidebar.expander("Index health (embeddings)"):
     try:
         df = pd.read_csv("embeddings/embedding_report.csv")
-        st.caption(f"🧾 Rows: {len(df)}")
+        st.caption(f"Rows: {len(df)}")
         if set(["chunks", "chars"]).issubset(df.columns):
             bad = df[(df["chunks"] == 0) | (df["chars"] < 200)]
             if len(bad):
-                st.warning(f"⚠️ {len(bad)} file(s) look sparse (<200 chars or 0 chunks).")
+                st.warning(f"{len(bad)} file(s) look sparse (<200 chars or 0 chunks).")
         st.dataframe(df.tail(50), use_container_width=True, height=220)
     except Exception:
-        st.caption("ℹ️ No report yet. Run **Refresh Data**.")
+        st.caption("No report yet. Run Refresh Data.")
 
-with st.sidebar.expander("🧹 Curate & Restack", expanded=False):
+# Optional curate & restack (only shown if knowledge_curator.py exists)
+with st.sidebar.expander("Curate & Restack", expanded=False):
     if not HAS_CURATOR:
-        st.caption("Add `knowledge_curator.py` to enable curation.")
+        st.caption("Add knowledge_curator.py to enable curation.")
     else:
         if st.button("Run Curator → Rebuild Index"):
             try:
@@ -200,22 +226,18 @@ with st.sidebar.expander("🧹 Curate & Restack", expanded=False):
             except Exception as e:
                 st.error(f"Failed: {e}")
 
-if st.sidebar.button("🔓 Logout"):
+if st.sidebar.button("Logout"):
     st.session_state["authenticated"] = False
     st.rerun()
 
-mode = st.sidebar.radio(
-    "🧭 Navigation",
-    ["💬 New Chat", "📜 View History", "✏️ Edit Conversation", "🔁 Refresh Data"],
-)
 st.sidebar.markdown("---")
-st.sidebar.caption("💡 Tip: Start a message with **REMINDER:** to teach the assistant instantly.")
+st.sidebar.caption("Tip: Start a message with REMINDER: to teach the assistant instantly.")
 
 # ─────────────────────────────────────────────────────────────
 # Modes
 # ─────────────────────────────────────────────────────────────
-if mode == "🔁 Refresh Data":
-    st.title("🔁 Refresh AI Knowledge Base")
+if mode == "Refresh Data":
+    st.title("Refresh AI Knowledge Base")
     st.caption("Parses local reminders + (optional) Google Drive docs, then re-embeds.")
     st.markdown(f"Last Refreshed: **{load_refresh_time()}**")
 
@@ -230,14 +252,14 @@ if mode == "🔁 Refresh Data":
             except Exception as e:
                 st.error(f"Failed: {e}")
 
-elif mode == "📜 View History":
-    st.title("📜 Chat History")
+elif mode == "View History":
+    st.title("Chat History")
     history = load_history()
     if not history:
         st.info("No chat history found.")
     else:
         for turn in history:
-            role = "👤 You" if turn.get("role") == "user" else "🧠 Assistant"
+            role = "You" if turn.get("role") == "user" else "Assistant"
             timestamp = turn.get("timestamp", "N/A")
             st.markdown(f"**{role} | [{timestamp}]**  \n{turn.get('content', '')}")
 
@@ -252,8 +274,8 @@ elif mode == "📜 View History":
             reset_chat()
             st.success("History cleared.")
 
-elif mode == "✏️ Edit Conversation":
-    st.title("✏️ Edit Conversation")
+elif mode == "Edit Conversation":
+    st.title("Edit Conversation")
     history = load_history()
     if not history:
         st.info("No chat history found.")
@@ -282,6 +304,12 @@ elif mode == "✏️ Edit Conversation":
             if turn.get("role") == "user":
                 if st.button("Regenerate assistant reply from here"):
                     try:
+                        # Ensure toggles exist in session_state
+                        if "limit_meetings" not in st.session_state:
+                            st.session_state["limit_meetings"] = False
+                        if "use_rag" not in st.session_state:
+                            st.session_state["use_rag"] = True
+
                         reply = regenerate_reply_for_user_turn(
                             idx,
                             limit_meetings=st.session_state.get("limit_meetings", False),
@@ -305,8 +333,8 @@ elif mode == "✏️ Edit Conversation":
             else:
                 st.caption("Only USER turns can be converted to a REMINDER.")
 
-elif mode == "💬 New Chat":
-    st.title("🧠 AI CEO Assistant")
+elif mode == "New Chat":
+    st.title("AI CEO Assistant")
     st.caption("Ask about meetings, projects, policies. Start a message with REMINDER: to teach facts.")
     st.markdown(f"Last Refreshed: **{load_refresh_time()}**")
 
@@ -351,7 +379,7 @@ elif mode == "💬 New Chat":
         history.append({"role": "user", "content": user_msg, "timestamp": now})
 
         with st.chat_message("assistant"):
-            with st.spinner("Processing…"):
+            with st.spinner("Processing..."):
                 try:
                     reply = answer(
                         user_msg,
@@ -361,6 +389,7 @@ elif mode == "💬 New Chat":
                         use_rag=st.session_state["use_rag"],
                     )
                 except TypeError:
+                    # Backward compatible with older answer() signature
                     reply = answer(
                         user_msg,
                         k=7,
