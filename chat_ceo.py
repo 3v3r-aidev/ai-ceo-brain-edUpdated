@@ -15,13 +15,14 @@ from answer_with_rag import answer
 # ─────────────────────────────────────────────────────────────
 st.set_page_config(page_title="AI CEO Assistant 🧠", page_icon="🧠", layout="wide")
 
-# Simple demo login (replace with your auth if needed)
-USERNAME = "admin123"
-PASSWORD = "BestOrg123@#"
+# Credentials from secrets (fallbacks for local dev)
+USERNAME = st.secrets.get("app_user", "admin123")
+PASSWORD = st.secrets.get("app_pass", "BestOrg123@#")
 
 # Paths
 HIST_PATH = Path("chat_history.json")
 REFRESH_PATH = Path("last_refresh.txt")
+HAS_CURATOR = Path("knowledge_curator.py").exists()
 
 # ─────────────────────────────────────────────────────────────
 # Auth
@@ -114,7 +115,6 @@ with st.sidebar.expander("📊 Index health (embeddings)"):
     try:
         df = pd.read_csv("embeddings/embedding_report.csv")
         st.caption(f"🧾 Rows: {len(df)}")
-        # Flag sparse rows if columns exist
         if set(["chunks", "chars"]).issubset(df.columns):
             bad = df[(df["chunks"] == 0) | (df["chars"] < 200)]
             if len(bad):
@@ -122,6 +122,22 @@ with st.sidebar.expander("📊 Index health (embeddings)"):
         st.dataframe(df.tail(50), use_container_width=True, height=220)
     except Exception:
         st.caption("ℹ️ No report yet. Run **Refresh Data**.")
+
+# Optional curate & restack (only shown if knowledge_curator.py exists)
+with st.sidebar.expander("🧹 Curate & Restack", expanded=False):
+    if not HAS_CURATOR:
+        st.caption("Add `knowledge_curator.py` to enable curation.")
+    else:
+        if st.button("Run Curator → Rebuild Index"):
+            try:
+                import knowledge_curator  # type: ignore
+                knowledge_curator.main()
+                file_parser.main()
+                embed_and_store.main()
+                save_refresh_time()
+                st.success("Curation + restack complete.")
+            except Exception as e:
+                st.error(f"Failed: {e}")
 
 if st.sidebar.button("🔓 Logout"):
     st.session_state["authenticated"] = False
@@ -245,3 +261,4 @@ elif mode == "💬 New Chat":
 
         history.append({"role": "assistant", "content": reply, "timestamp": ts})
         save_history(history)
+
