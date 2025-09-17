@@ -374,3 +374,5 @@ elif mode == "💬 New Chat":
 
         history.append({"role": "assistant", "content": reply, "timestamp": ts})
         save_history(history)
+
+
